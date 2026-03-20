@@ -91,7 +91,7 @@ class VisionProducer(threading.Thread):
 
     def run(self):
         try:
-            cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             time.sleep(2)
