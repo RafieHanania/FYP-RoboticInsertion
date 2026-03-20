@@ -6,11 +6,9 @@ target/
 UrRtde.egg-info/
 venv/
 venv312/
-
 __pycache__/
 *.pyc
 *.pyo
 *.log
-
-recorded_sessions/
+recorded_session/
 logging_archive/
