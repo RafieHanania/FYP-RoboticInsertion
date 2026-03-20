@@ -80,6 +80,30 @@ class VisionProducer(threading.Thread):
 
         return frame
 
+    @staticmethod
+    def _canonicalize_obb(w, h, theta):
+        """Collapse all equivalent OBB representations to |θ| ≤ 45°.
+
+        A rectangle has two equivalent OBB forms that differ by a w/h swap
+        and a 90° theta shift.  We pick the one with θ closest to 0 (our
+        servo target), which eliminates both the ±90° axis-swap flicker
+        and the ±π/2 wrap-boundary discontinuity.
+
+        Returns (w_canon, h_canon, theta_canon) with theta in [-π/4, π/4].
+        """
+        # Step 1: collapse the π-periodicity → θ ∈ [-π/2, π/2)
+        theta = (theta + math.pi / 2) % math.pi - math.pi / 2
+
+        # Step 2: if |θ| > 45°, swap axes and shift by 90° toward zero
+        if theta > math.pi / 4:                       # CHANGED
+            w, h = h, w                                # CHANGED
+            theta -= math.pi / 2                       # CHANGED
+        elif theta < -math.pi / 4:                     # CHANGED
+            w, h = h, w                                # CHANGED
+            theta += math.pi / 2                       # CHANGED
+
+        return w, h, theta
+
     def predict(self, frame): # use old model with multiple class
         results = self.model.predict(
             source=frame,
@@ -118,21 +142,15 @@ class VisionProducer(threading.Thread):
                     annotated = result.plot(
                         conf=False,
                         line_width=1,
-                        # font_size=8,
                         labels=False
-
                     )
                     annotated = self._draw_target_overlay(annotated)
-                    self.latest_frame.set(annotated)
-
-                    if self._writer is None:
-                        self._init_writer(annotated, fps)
-                    self._writer.write(annotated)
 
                     if result.obb is not None and len(result.obb) > 0:
                         xywhr_np = result.obb.xywhr.cpu().numpy()
                         conf_np = result.obb.conf.cpu().numpy()
                         for (u, v, w, h, theta), conf in zip(xywhr_np, conf_np):
+                            w, h, theta = self._canonicalize_obb(w, h, theta)  # CHANGED
                             angle_deg = math.degrees(theta)
                             cv2.putText(annotated, f"{angle_deg:.1f} deg",
                                         (int(u), int(v) - 10),
@@ -141,12 +159,12 @@ class VisionProducer(threading.Thread):
                             det = Detection(t=time.time(), u=u, v=v, w=w, h=h, theta=theta, conf=conf)
                             self.det_out.set(det)
 
-                    annotated = self._draw_target_overlay(annotated)
-                    self.latest_frame.set(annotated)
+                    self.latest_frame.set(annotated)             # CHANGED — was duplicated
 
-                    if self._writer is None:
+                    if self._writer is None:                     # CHANGED — was duplicated
                         self._init_writer(annotated, fps)
                     self._writer.write(annotated)
+
         except BaseException as e:
             print(f"[VisionProducer] CRASHED: {e}")
             import traceback
