@@ -142,11 +142,6 @@ class VisionProducer(threading.Thread):
                     if result.obb is not None and len(result.obb) > 0:
                         xywhr_np = result.obb.xywhr.cpu().numpy()
                         conf_np = result.obb.conf.cpu().numpy()
-
-                        best = int(conf_np.argmax())                # CHANGED
-                        u, v, w, h, theta = xywhr_np[best]         # CHANGED
-                        conf = conf_np[best]       
-
                         for (u, v, w, h, theta), conf in zip(xywhr_np, conf_np):
                             w, h, theta = self._canonicalize_obb(w, h, theta)  # CHANGED
                             angle_deg = math.degrees(theta)
