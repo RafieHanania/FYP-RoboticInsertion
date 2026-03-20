@@ -1,0 +1,2 @@
+time,det_valid,det_conf,det_t,det_u,det_v,det_w,det_h,det_theta,u_filtered,v_filtered,area_filtered,sin_filtered,cos_filtered,theta_filtered,e_u,e_v,e_area,e_theta,vx,vy,vz,wx,wy,wz
+1773772689.267809,False,,,,,,,,,,,,,,,,,,0.0,0.0,0.0,0.0,0.0,0.0

@@ -6,3 +6,6 @@ target
 UrRtde.egg-info
 venv
 *pyc
+recorded_session
+logging_archive
+venv312
