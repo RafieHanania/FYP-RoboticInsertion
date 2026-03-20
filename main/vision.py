@@ -80,6 +80,23 @@ class VisionProducer(threading.Thread):
 
         return frame
 
+    @staticmethod                                                   # CHANGED
+    def _canonicalize_obb(w, h, theta):                             # CHANGED
+        """Enforce h >= w (long side = h) to eliminate 90° flip ambiguity.
+        
+        When the detector swaps w/h, it compensates with a 90° theta jump.
+        We undo that by always assigning the longer side to h and adjusting
+        theta accordingly:  (w, h, θ)  ≡  (h, w, θ − π/2)  geometrically.
+        
+        Returns (w_canon, h_canon, theta_canon) with theta in [-π/2, π/2].
+        """
+        if w > h:                                                   # CHANGED
+            w, h = h, w                                             # CHANGED
+            theta = theta - math.pi / 2                             # CHANGED
+        # wrap to [-π/2, π/2]                                       # CHANGED
+        theta = (theta + math.pi / 2) % math.pi - math.pi / 2     # CHANGED
+        return w, h, theta                                          # CHANGED
+
     def predict(self, frame): # use old model with multiple class
         results = self.model.predict(
             source=frame,
@@ -91,7 +108,7 @@ class VisionProducer(threading.Thread):
 
     def run(self):
         try:
-            cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             time.sleep(2)
@@ -118,21 +135,20 @@ class VisionProducer(threading.Thread):
                     annotated = result.plot(
                         conf=False,
                         line_width=1,
-                        # font_size=8,
                         labels=False
-
                     )
                     annotated = self._draw_target_overlay(annotated)
-                    self.latest_frame.set(annotated)
-
-                    if self._writer is None:
-                        self._init_writer(annotated, fps)
-                    self._writer.write(annotated)
 
                     if result.obb is not None and len(result.obb) > 0:
                         xywhr_np = result.obb.xywhr.cpu().numpy()
                         conf_np = result.obb.conf.cpu().numpy()
+
+                        best = int(conf_np.argmax())                # CHANGED
+                        u, v, w, h, theta = xywhr_np[best]         # CHANGED
+                        conf = conf_np[best]       
+
                         for (u, v, w, h, theta), conf in zip(xywhr_np, conf_np):
+                            w, h, theta = self._canonicalize_obb(w, h, theta)  # CHANGED
                             angle_deg = math.degrees(theta)
                             cv2.putText(annotated, f"{angle_deg:.1f} deg",
                                         (int(u), int(v) - 10),
@@ -141,12 +157,12 @@ class VisionProducer(threading.Thread):
                             det = Detection(t=time.time(), u=u, v=v, w=w, h=h, theta=theta, conf=conf)
                             self.det_out.set(det)
 
-                    annotated = self._draw_target_overlay(annotated)
-                    self.latest_frame.set(annotated)
+                    self.latest_frame.set(annotated)             # CHANGED — was duplicated
 
-                    if self._writer is None:
+                    if self._writer is None:                     # CHANGED — was duplicated
                         self._init_writer(annotated, fps)
                     self._writer.write(annotated)
+
         except BaseException as e:
             print(f"[VisionProducer] CRASHED: {e}")
             import traceback
