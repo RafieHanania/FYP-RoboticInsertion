@@ -80,22 +80,29 @@ class VisionProducer(threading.Thread):
 
         return frame
 
-    @staticmethod                                                   # CHANGED
-    def _canonicalize_obb(w, h, theta):                             # CHANGED
-        """Enforce h >= w (long side = h) to eliminate 90° flip ambiguity.
-        
-        When the detector swaps w/h, it compensates with a 90° theta jump.
-        We undo that by always assigning the longer side to h and adjusting
-        theta accordingly:  (w, h, θ)  ≡  (h, w, θ − π/2)  geometrically.
-        
-        Returns (w_canon, h_canon, theta_canon) with theta in [-π/2, π/2].
+    @staticmethod
+    def _canonicalize_obb(w, h, theta):
+        """Collapse all equivalent OBB representations to |θ| ≤ 45°.
+
+        A rectangle has two equivalent OBB forms that differ by a w/h swap
+        and a 90° theta shift.  We pick the one with θ closest to 0 (our
+        servo target), which eliminates both the ±90° axis-swap flicker
+        and the ±π/2 wrap-boundary discontinuity.
+
+        Returns (w_canon, h_canon, theta_canon) with theta in [-π/4, π/4].
         """
-        if w > h:                                                   # CHANGED
-            w, h = h, w                                             # CHANGED
-            theta = theta - math.pi / 2                             # CHANGED
-        # wrap to [-π/2, π/2]                                       # CHANGED
-        theta = (theta + math.pi / 2) % math.pi - math.pi / 2     # CHANGED
-        return w, h, theta                                          # CHANGED
+        # Step 1: collapse the π-periodicity → θ ∈ [-π/2, π/2)
+        theta = (theta + math.pi / 2) % math.pi - math.pi / 2
+
+        # Step 2: if |θ| > 45°, swap axes and shift by 90° toward zero
+        if theta > math.pi / 4:                       # CHANGED
+            w, h = h, w                                # CHANGED
+            theta -= math.pi / 2                       # CHANGED
+        elif theta < -math.pi / 4:                     # CHANGED
+            w, h = h, w                                # CHANGED
+            theta += math.pi / 2                       # CHANGED
+
+        return w, h, theta
 
     def predict(self, frame): # use old model with multiple class
         results = self.model.predict(
