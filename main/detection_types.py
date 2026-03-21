@@ -7,5 +7,5 @@ class Detection:
     v: float
     w: float
     h: float
-    theta: float # radians -pi/2 to pi/2
+    theta: float  # radians, canonicalised to [-pi/4, pi/4]
     conf: float
