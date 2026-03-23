@@ -1,24 +1,28 @@
 """
 Classical Image-Based Visual Servoing (IBVS) controller.
 
-Control law:   v_cmd = -λ · L_red⁻¹ · e
+Control law:   v_cmd = -lambda * L_red^-1 * e
 
-Feature vector:  s = [u, v, ln_σ, θ]
-  - u, v    : bounding box center (pixels)
-  - ln_σ    : log scale ratio  ln(√(w·h) / √(w*·h*))
-               using log linearises the depth relationship
-  - θ       : OBB orientation (radians)
+Feature vector:  s = [u, v, ln_sigma, theta]
+  - u, v      : bounding box center (pixels)
+  - ln_sigma  : log scale ratio  ln(sqrt(w*h) / sqrt(w_d*h_d))
+  - theta     : OBB orientation (radians)
 
-Interaction matrix L_red is the 4×4 sub-matrix of the full
+Interaction matrix L_red is the 4x4 sub-matrix of the full
 6-column interaction matrix, keeping only the columns for the
-4 DOF we command: (vx, vy, vz, ωz).
+4 DOF we command: (vx, vy, vz, wz).
 
 Depth Z is estimated from bounding box area using the thin-lens
-model.  Errors in Z only affect velocity magnitude, not direction —
-IBVS convergence is guaranteed regardless of depth accuracy.
+model.  Errors in Z only affect velocity magnitude, not direction.
 
-Reference: Chaumette & Hutchinson, "Visual Servo Control,
-Part I: Basic Approaches", IEEE RAM, 2006.
+Resolution scaling
+------------------
+All pixel-domain defaults (w_d, h_d, dead_u, dead_v) are specified
+at the *reference* resolution (640x480).  The ``resolution_scale``
+parameter (ratio of current fx to reference fx, supplied by app.py
+via camera_config) automatically scales them to the active resolution.
+Intrinsics (fx, fy, cx, cy) are passed in directly — no hardcoded
+defaults.
 """
 
 import time
@@ -34,6 +38,12 @@ from controller_logger import ControllerLogger
 
 cmd6 = Tuple[float, float, float, float, float, float]
 
+# ---- Reference-resolution defaults (640x480) ----
+_REF_W_D    = 35.0      # desired OBB width  (pixels @ 640x480)
+_REF_H_D    = 35.0      # desired OBB height (pixels @ 640x480)
+_REF_DEAD_U = 2.0       # pixel dead-zone    (pixels @ 640x480)
+_REF_DEAD_V = 2.0
+
 
 class VisualServoController(threading.Thread):
 
@@ -44,33 +54,47 @@ class VisualServoController(threading.Thread):
         stop_event: threading.Event,
         img_w: int,
         img_h: int,
-        # ---- Camera intrinsics ----
-        fx: float = 618.072,
-        fy: float = 618.201,
-        cx: float = 318.662,
-        cy: float = 240.939,
-        # ---- Extrinsic: camera frame → TCP frame (3×3 rotation) ----
+        # ---- Camera intrinsics (REQUIRED) ----                   # CHANGED
+        fx: float,
+        fy: float,
+        cx: float,
+        cy: float,
+        # ---- Resolution scale factor (from camera_config) ----   # CHANGED
+        resolution_scale: float = 1.0,
+        # ---- Extrinsic: camera frame -> TCP frame (3x3 rotation) ----
         R_cam_to_tcp: np.ndarray = None,
         # ---- Controller parameters ----
         rate_hz: float = 100.0,
         conf_min: float = 0.2,
         stale_s: float = 0.2,
         # ---- Desired feature values ----
-        u_d: float = None,              # image center by default
-        v_d: float = None,
+        # u_d: float = None,              # image center by default
+        # v_d: float = None,
+
+        # ---- After the existing desired feature parameters ----
+
+        # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----  # CHANGED
+        # Positive = TCP is in the +x / +y direction of camera frame
+        # Flip sign if the robot moves the wrong way on first test
+        tcp_offset_x: float = 0.028,    # ~3.4 cm
+        tcp_offset_y: float = 0.028,    # ~3.4 cm
+
+
         theta_d: float = 0.0,          # desired OBB angle (rad)
         # ---- Desired bounding box size at target distance ----
-        w_d: float = 35.0,             # desired OBB width  (pixels)
-        h_d: float = 35.0,             # desired OBB height (pixels)
+        #      None => auto-scale from 640x480 reference values    # CHANGED
+        w_d: float = None,
+        h_d: float = None,
         # ---- Depth calibration ----
         Z_d: float = 0.15,             # depth (m) at which w_d, h_d were measured
-        # ---- IBVS gain λ  ----
+        # ---- IBVS gain lambda ----
         lam: float = 0.5,
         # ---- Dead-zones ----
-        dead_u: float = 2.0,           # pixels
-        dead_v: float = 2.0,
+        #      None => auto-scale from 640x480 reference values    # CHANGED
+        dead_u: float = None,
+        dead_v: float = None,
         dead_theta: float = math.radians(2.0),
-        dead_scale: float = 0.05,      # ln-scale (≈ 5% size tolerance)
+        dead_scale: float = 0.05,      # ln-scale (approx 5% size tolerance)
         # ---- Velocity limits ----
         vxy_max: float = 0.05,
         vz_max: float = 0.03,
@@ -91,13 +115,15 @@ class VisualServoController(threading.Thread):
         self.conf_min = conf_min
         self.stale_s = stale_s
 
-        # Intrinsics
+        s = resolution_scale                              # CHANGED — shorthand
+
+        # Intrinsics (passed in, no defaults)
         self.fx = fx
         self.fy = fy
-        self.cx = cx if cx is not None else img_w / 2.0
-        self.cy = cy if cy is not None else img_h / 2.0
+        self.cx = cx
+        self.cy = cy
 
-        # Extrinsic — 6×6 velocity rotation block
+        # Extrinsic — 6x6 velocity rotation block
         if R_cam_to_tcp is None:
             R = np.array([
                 [ 0, -1,  0],
@@ -106,18 +132,27 @@ class VisualServoController(threading.Thread):
             ], dtype=float)
         else:
             R = np.asarray(R_cam_to_tcp, dtype=float)
+        
+        # FIXED — handle pseudovector correctly:
+        d = np.linalg.det(R)
         self.T_cam_to_tcp = np.block([
             [R,                np.zeros((3, 3))],
-            [np.zeros((3, 3)), R               ],
-        ])   # 6×6
+            [np.zeros((3, 3)), d * R           ],   # CHANGED: det(R) * R for angular velocity
+        ])
+        # 6x6
 
-        # Desired features
-        self.u_d     = u_d if u_d is not None else img_w / 2.0
-        self.v_d     = v_d if v_d is not None else img_h / 2.0
+        # # Desired features — pixel targets auto-scaled               # CHANGED
+        # self.u_d     = u_d if u_d is not None else img_w / 2.0
+        # self.v_d     = v_d if v_d is not None else img_h / 2.0
+
+        # CHANGED — depth-dependent target, computed each frame
+        self.tcp_offset_x = tcp_offset_x
+        self.tcp_offset_y = tcp_offset_y
+
         self.theta_d = theta_d
-        self.w_d     = w_d
-        self.h_d     = h_d
-        self.area_d  = w_d * h_d
+        self.w_d     = w_d if w_d is not None else _REF_W_D * s      # CHANGED
+        self.h_d     = h_d if h_d is not None else _REF_H_D * s      # CHANGED
+        self.area_d  = self.w_d * self.h_d
 
         # Depth calibration
         self.Z_d = Z_d
@@ -125,9 +160,9 @@ class VisualServoController(threading.Thread):
         # Gain
         self.lam = lam
 
-        # Dead-zones
-        self.dead_u     = dead_u
-        self.dead_v     = dead_v
+        # Dead-zones — pixel dead-zones auto-scaled                   # CHANGED
+        self.dead_u     = dead_u if dead_u is not None else _REF_DEAD_U * s
+        self.dead_v     = dead_v if dead_v is not None else _REF_DEAD_V * s
         self.dead_theta = dead_theta
         self.dead_scale = dead_scale
 
@@ -136,7 +171,7 @@ class VisualServoController(threading.Thread):
         self.vz_max  = vz_max
         self.wz_max  = wz_max
 
-        # Kalman filter (replaces 6 separate EMA filters)
+        # Kalman filter
         self.kf = DetectionKalmanFilter(
             dt=1.0 / camera_fps,
             sigma_pos=kf_sigma_pos,
@@ -150,13 +185,15 @@ class VisualServoController(threading.Thread):
         # Initialise command buffer
         self.cmd_out.set((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
+        # ---- Log the effective config for debugging ----            # CHANGED
+        print(f"[Controller] resolution_scale={s:.3f}  "
+              f"fx={fx:.1f}  fy={fy:.1f}  cx={cx:.1f}  cy={cy:.1f}")
+        print(f"[Controller] w_d={self.w_d:.1f}  h_d={self.h_d:.1f}  "
+              f"dead_u={self.dead_u:.1f}  dead_v={self.dead_v:.1f}  "
+              f"camera_fps={camera_fps:.1f}")
+
     # ------------------------------------------------------------------
-    # Depth estimator — thin-lens approximation from bounding box area
-    #
-    #   Z = Z_d · √(area_d / area)
-    #
-    # Errors in Z only scale the velocity magnitude, not its direction.
-    # IBVS converges regardless of depth accuracy (Chaumette, 2006).
+    # Depth estimator
     # ------------------------------------------------------------------
     def _estimate_Z(self, area: float) -> float:
         if area <= 0:
@@ -164,10 +201,7 @@ class VisualServoController(threading.Thread):
         return self.Z_d * math.sqrt(self.area_d / area)
 
     # ------------------------------------------------------------------
-    # 4×4 reduced interaction matrix
-    #
-    #   Features:  s = [u, v, ln_σ, θ]
-    #   Commands:  v = [vx, vy, vz, ωz]   (columns 0,1,2,5 of full L)
+    # 4x4 reduced interaction matrix
     # ------------------------------------------------------------------
     def _build_L_reduced(
         self, u_px: float, v_px: float, Z: float
@@ -176,35 +210,12 @@ class VisualServoController(threading.Thread):
         up = u_px - self.cx
         vp = v_px - self.cy
 
-        Lu = np.array([
-            -fx / Z,
-             0.0,
-             up / Z,
-             vp * fx / fy,
-        ])
+        Lu = np.array([-fx / Z, 0.0, up / Z, vp * fx / fy])
+        Lv = np.array([0.0, -fy / Z, vp / Z, -up * fy / fx])
+        L_sigma = np.array([0.0, 0.0, -1.0 / Z, 0.0])
+        L_theta = np.array([0.0, 0.0, 0.0, -1.0])
 
-        Lv = np.array([
-             0.0,
-            -fy / Z,
-             vp / Z,
-            -up * fy / fx,
-        ])
-
-        L_sigma = np.array([
-             0.0,
-             0.0,
-            -1.0 / Z,
-             0.0,
-        ])
-
-        L_theta = np.array([
-             0.0,
-             0.0,
-             0.0,
-            -1.0,
-        ])
-
-        return np.vstack([Lu, Lv, L_sigma, L_theta])   # 4×4
+        return np.vstack([Lu, Lv, L_sigma, L_theta])   # 4x4
 
     # ------------------------------------------------------------------
     # Thread entry
@@ -255,7 +266,7 @@ class VisualServoController(threading.Thread):
                 now=now, det=det, ok=ok,
                 u_f=None, v_f=None, w_f=None, h_f=None, area=None,
                 sin_f=None, cos_f=None, theta_f=None,
-                Z_est=None, ln_sigma=None,
+                Z_est=None, u_d=None, v_d=None, ln_sigma=None,
                 e=None, L_red=None, v_cam=None, v_tcp=None,
                 cmd=cmd,
             )
@@ -281,9 +292,16 @@ class VisualServoController(threading.Thread):
         else:
             ln_sigma = 0.0
 
-        # ---- 3. Compute feature error  e = s - s*  ----
-        e_u     = u_f - self.u_d
-        e_v     = v_f - self.v_d
+        # ---- 3. Estimate depth from area ----
+        Z_est = self._estimate_Z(area)
+
+        # ---- 4. Depth-dependent target pixel (TCP-object alignment) ----
+        u_d = self.fx * self.tcp_offset_x / Z_est + self.cx
+        v_d = self.fy * self.tcp_offset_y / Z_est + self.cy
+
+        # ---- 5. Compute feature error  e = s - s*  ----
+        e_u     = u_f - u_d
+        e_v     = v_f - v_d
         e_sigma = ln_sigma
         e_theta = wrap_to_pi(theta_f - self.theta_d)
 
@@ -298,10 +316,7 @@ class VisualServoController(threading.Thread):
 
         e = np.array([e_u, e_v, e_sigma, e_theta])
 
-        # ---- 4. Estimate depth from area ----
-        Z_est = self._estimate_Z(area)
-
-        # ---- 5. Build 4×4 reduced interaction matrix ----
+        # ---- 6. Build 4x4 reduced interaction matrix ----
         L_red = self._build_L_reduced(u_f, v_f, Z_est)
 
         # ---- 6. Classical IBVS control law ----
@@ -310,14 +325,10 @@ class VisualServoController(threading.Thread):
         except np.linalg.LinAlgError:
             v_cam = -self.lam * (np.linalg.pinv(L_red) @ e)
 
-        # ---- 7. Map camera-frame velocity → TCP-frame velocity ----
+        # ---- 7. Map camera-frame velocity -> TCP-frame velocity ----
         v_cam_6 = np.array([
-            v_cam[0],
-            v_cam[1],
-            v_cam[2],
-            0.0,
-            0.0,
-            v_cam[3],
+            v_cam[0], v_cam[1], v_cam[2],
+            0.0, 0.0, v_cam[3],
         ])
         v_tcp = self.T_cam_to_tcp @ v_cam_6
 
@@ -335,7 +346,7 @@ class VisualServoController(threading.Thread):
             now=now, det=det, ok=ok,
             u_f=u_f, v_f=v_f, w_f=w_f, h_f=h_f, area=area,
             sin_f=s_sin, cos_f=s_cos, theta_f=theta_f,
-            Z_est=Z_est, ln_sigma=ln_sigma,
+            Z_est=Z_est, u_d=u_d, v_d=v_d, ln_sigma=ln_sigma,
             e=e, L_red=L_red, v_cam=v_cam, v_tcp=v_tcp,
             cmd=cmd,
         )

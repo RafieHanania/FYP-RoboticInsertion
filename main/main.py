@@ -3,26 +3,27 @@ from app import VisualServoApp
 import cv2
 
 RTDE_PORT = 30004
-ROBOT_IP = "169.254.149.88"
-RECIPE_PATH = "control_loop_configuration.xml" 
+ROBOT_IP = "10.149.230.1"
+RECIPE_PATH = "control_loop_configuration.xml"
 RATE_HZ = 100
-IMAGE_WIDTH = 640
-IMAGE_HEIGHT = 480
+
+# ---- Change resolution here — everything else auto-adjusts ---- # CHANGED
+# Supported: 424x240, 640x480, 1280x720, 1920x1080
+IMAGE_WIDTH  = 1280
+IMAGE_HEIGHT = 720
 
 
-def main(robot_ip=ROBOT_IP, recipe_path=RECIPE_PATH, rate_hz=RATE_HZ, img_w=IMAGE_WIDTH, img_h=IMAGE_HEIGHT, rtde_port=RTDE_PORT):
-    app = VisualServoApp(robot_ip, 
-                         recipe_path, 
+def main(robot_ip=ROBOT_IP, recipe_path=RECIPE_PATH, rate_hz=RATE_HZ,
+         img_w=IMAGE_WIDTH, img_h=IMAGE_HEIGHT, rtde_port=RTDE_PORT):
+    app = VisualServoApp(robot_ip,
+                         recipe_path,
                          rate_hz,
                          img_w,
                          img_h,
-                         rtde_port
+                         rtde_port,
                          )
     print("hello")
     app.start()
-    # print(f"Vision thread alive: {app.vision.is_alive()}")  # add this
-    # print(f"Vision thread started: {app.vision.ident}")     # add this
-
 
     try:
         while True:
@@ -40,7 +41,6 @@ def main(robot_ip=ROBOT_IP, recipe_path=RECIPE_PATH, rate_hz=RATE_HZ, img_w=IMAG
 
     except KeyboardInterrupt:
         pass
-            # time.sleep(1.0)
     finally:
         app.stop()
         cv2.destroyAllWindows()
@@ -48,5 +48,3 @@ def main(robot_ip=ROBOT_IP, recipe_path=RECIPE_PATH, rate_hz=RATE_HZ, img_w=IMAG
 
 if __name__ == '__main__':
     main()
-
-

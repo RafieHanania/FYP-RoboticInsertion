@@ -11,6 +11,7 @@ import os
 
 from detection_types import Detection
 from buffers import LatestValue
+from camera_config import max_fps                              # CHANGED
 
 MODEL_PATH = '../models/saved_runs/train/weights/best.pt'
 
@@ -74,16 +75,16 @@ class VisionProducer(threading.Thread):
         return frame
 
     @staticmethod
+    @staticmethod
     def _canonicalize_obb(w, h, theta):
-        """Collapse all equivalent OBB representations to |θ| ≤ 45°."""
+        """Canonicalize OBB so that w >= h, with theta in (-90°, +90°]."""
+        # First, wrap theta into (-90°, +90°]
         theta = (theta + math.pi / 2) % math.pi - math.pi / 2
 
-        if theta > math.pi / 4:
+        # Ensure w is the longer dimension (matches USB-A physical aspect ratio)
+        if h > w:                          # CHANGED — was: theta > pi/4
             w, h = h, w
-            theta -= math.pi / 2
-        elif theta < -math.pi / 4:
-            w, h = h, w
-            theta += math.pi / 2
+            theta += math.pi / 2 if theta <= 0 else -math.pi / 2
 
         return w, h, theta
 
@@ -98,7 +99,7 @@ class VisionProducer(threading.Thread):
 
     def run(self):
         try:
-            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.img_w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.img_h)
             time.sleep(2)
@@ -111,7 +112,7 @@ class VisionProducer(threading.Thread):
                 print("Failed to open Camera")
                 return
 
-            fps = 30.0
+            fps = max_fps(self.img_w, self.img_h)           # CHANGED
 
             while not self.stop_event.is_set():
                 ok, frame = cap.read()

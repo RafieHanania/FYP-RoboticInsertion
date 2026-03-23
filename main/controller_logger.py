@@ -50,6 +50,8 @@ class ControllerLogger:
             "s_v",
             "s_ln_sigma",
             "s_theta",
+            "u_d",
+            "u_d"
             # --- Feature errors  e = s - s*  (post-deadband) ---
             "e_u",
             "e_v",
@@ -96,6 +98,9 @@ class ControllerLogger:
         theta_f: Optional[float],
         # Depth (area-based estimate)
         Z_est: Optional[float],
+
+        u_d: Optional[float],    # CHANGED
+        v_d: Optional[float],    # CHANGED
         # Feature values
         ln_sigma: Optional[float],
         # Feature errors (post-deadband)
@@ -151,6 +156,9 @@ class ControllerLogger:
             theta_f,
             # Depth
             Z_est,
+
+            u_d,        # CHANGED
+            v_d,        # CHANGED
             # Feature values
             u_f,
             v_f,
