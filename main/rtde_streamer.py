@@ -2,10 +2,12 @@ import time
 import threading
 from typing import Tuple
 import sys
+import numpy as np
 
 sys.path.append("..")
 
 from rtde import rtde_config, rtde
+from utils import vel_tcp_to_base
 
 cmd6 = Tuple[float, float, float, float, float, float]
 
@@ -44,14 +46,9 @@ class RTDEStreamer(threading.Thread):
 
         con.get_controller_version()
 
-        con.send_output_setup(state_names, state_types, frequency=10)
+        con.send_output_setup(state_names, state_types, frequency=self.rate_hz)
         setp = con.send_input_setup(setp_names, setp_types)
         watchdog = con.send_input_setup(watchdog_names, watchdog_types)
-
-        # con.send_output_setup(state_names, state_types)
-        # state = con.send_input_setup(state_names, state_types)
-
-        # # print(state.)
 
         if setp is None or watchdog is None:
             raise RuntimeError("RTDE input setup failed")
@@ -70,15 +67,31 @@ class RTDEStreamer(threading.Thread):
             con.send(watchdog)
 
             while not self.stop_event.is_set():
-                # state = con.receive()
-                # if state is None:
-                #     raise RuntimeError("Connection Lost")
+                state = con.receive()
+                if state is None:
+                    # Error --> send zero and restart next cycle
+                    self._write_cmd(setp, (0,0,0,0,0,0))
+                    con.send(setp)
+                    time.sleep(dt)
+                    continue
 
+                # Extract rotation-vector part of actual_tcp_pose
+                tcp_pose = state.actual_TCP_pose
+                rx, ry, rz = tcp_pose[3], tcp_pose[4], tcp_pose[5]
 
-                cmd: cmd6 = self.cmd_in.get() or (0,0,0,0,0,0)
-                # print(cmd)
+                # Read TCP-frame command from controller
+                cmd_tcp: cmd6 = self.cmd_in.get() or (0,0,0,0,0,0)
 
-                self._write_cmd(setp, cmd)
+                # Rotate TCP-frame velocity
+                v_tcp = np.array(cmd_tcp, dtype=float)
+                v_base = vel_tcp_to_base(v_tcp, rx, ry, rz)
+
+                cmd_base = (
+                    v_base[0], v_base[1], v_base[2], 
+                    v_base[3], v_base[4], v_base[5]
+                ) 
+
+                self._write_cmd(setp, cmd_base)
                 # print(dt)
 
                 heartbeat += 1
@@ -93,7 +106,8 @@ class RTDEStreamer(threading.Thread):
 
         except Exception as e:
             print("RTDE send failed")
-            print("cmd =", cmd)
+            print("cmd_tcp =", cmd_tcp)
+            print("cmd_base =", cmd_base)
             print("heartbeat =", heartbeat)
             print("cmd_valid =", watchdog.input_int_register_0)
             raise

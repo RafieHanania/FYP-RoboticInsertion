@@ -1,8 +1,7 @@
 <?xml version="1.0"?>
 <rtde_config>
 	<recipe key="state">
-		<field name="actual_tcp_pose" type="VECTOR6D">
-		<field name="robot_mode" type="INT32"/>
+		<field name="actual_TCP_pose" type="VECTOR6D"/>
 	</recipe>
 
 	<recipe key="setp">

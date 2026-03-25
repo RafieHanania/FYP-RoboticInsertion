@@ -39,8 +39,8 @@ from controller_logger import ControllerLogger
 cmd6 = Tuple[float, float, float, float, float, float]
 
 # ---- Reference-resolution defaults (640x480) ----
-_REF_W_D    = 35.0      # desired OBB width  (pixels @ 640x480)
-_REF_H_D    = 35.0      # desired OBB height (pixels @ 640x480)
+_REF_W_D    = 60      # desired OBB width  (pixels @ 640x480)
+_REF_H_D    = 22.5      # desired OBB height (pixels @ 640x480)
 _REF_DEAD_U = 2.0       # pixel dead-zone    (pixels @ 640x480)
 _REF_DEAD_V = 2.0
 
@@ -76,8 +76,8 @@ class VisualServoController(threading.Thread):
         # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----  # CHANGED
         # Positive = TCP is in the +x / +y direction of camera frame
         # Flip sign if the robot moves the wrong way on first test
-        tcp_offset_x: float = 0.028,    # ~3.4 cm
-        tcp_offset_y: float = 0.028,    # ~3.4 cm
+        tcp_offset_x: float = 0.024,    # ~3.4 cm
+        tcp_offset_y: float = 0.032,    # ~3.4 cm
 
 
         theta_d: float = 0.0,          # desired OBB angle (rad)
@@ -86,7 +86,7 @@ class VisualServoController(threading.Thread):
         w_d: float = None,
         h_d: float = None,
         # ---- Depth calibration ----
-        Z_d: float = 0.15,             # depth (m) at which w_d, h_d were measured
+        Z_d: float = 0.117,             # depth (m) at which w_d, h_d were measured
         # ---- IBVS gain lambda ----
         lam: float = 0.5,
         # ---- Dead-zones ----
@@ -97,13 +97,13 @@ class VisualServoController(threading.Thread):
         dead_scale: float = 0.05,      # ln-scale (approx 5% size tolerance)
         # ---- Velocity limits ----
         vxy_max: float = 0.05,
-        vz_max: float = 0.03,
+        vz_max: float = 0.06,
         wz_max: float = 0.6,
         # ---- Kalman filter tuning ----
         kf_sigma_pos: float = 2.0,
-        kf_sigma_vel: float = 5.0,
-        kf_sigma_meas_pos: float = 5.0,
-        kf_sigma_meas_size: float = 5.0,
+        kf_sigma_vel: float = 20.0,
+        kf_sigma_meas_pos: float = 15.0,
+        kf_sigma_meas_size: float = 15.0,
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
     ):
@@ -126,9 +126,9 @@ class VisualServoController(threading.Thread):
         # Extrinsic — 6x6 velocity rotation block
         if R_cam_to_tcp is None:
             R = np.array([
-                [ 0, -1,  0],
                 [-1,  0,  0],
-                [ 0,  0,  1],
+                [ 0, -1,  0],
+                [ 0,  0, -1],
             ], dtype=float)
         else:
             R = np.asarray(R_cam_to_tcp, dtype=float)
@@ -180,7 +180,9 @@ class VisualServoController(threading.Thread):
             sigma_meas_size=kf_sigma_meas_size,
             sigma_meas_angle=kf_sigma_meas_angle,
         )
-        self._last_det_t: float = 0.0
+        # self._last_det_t: float = 0.0
+        self._last_tick_t: float = 0.0       # wall time — for KF predict dt
+        self._last_det_stamp: float = 0.0    # det.t    — for new-frame gating
 
         # Initialise command buffer
         self.cmd_out.set((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
@@ -259,7 +261,7 @@ class VisualServoController(threading.Thread):
 
         if not ok:
             if self.kf.initialised:
-                dt_pred = now - self._last_det_t if self._last_det_t > 0 else None
+                dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
                 self.kf.predict(dt=dt_pred)
             cmd = (vx, vy, vz, wx, wy, wz)
             logger.log(
@@ -273,11 +275,14 @@ class VisualServoController(threading.Thread):
             return cmd
 
         # ---- 1. Kalman predict + update ----
-        dt_pred = now - self._last_det_t if self._last_det_t > 0 else None
-        self._last_det_t = now
+        dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
+        self._last_tick_t = now
 
         self.kf.predict(dt=dt_pred)
-        self.kf.update(det)
+        if det.t != self._last_det_stamp:    # same det.t means same camera frame
+            self.kf.update(det)
+            self._last_det_stamp = det.t
+
 
         u_f, v_f, w_f, h_f, theta_f = self.kf.state()
 
