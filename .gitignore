@@ -12,3 +12,4 @@ __pycache__/
 *.log
 recorded_session/
 logging_archive/
+data_analysis/
