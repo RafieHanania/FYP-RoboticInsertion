@@ -24,6 +24,8 @@ class ControllerLogger:
         self.csv_writer.writerow([
             # --- Timing ---
             "time",
+            # --- State machine ---
+            "state",                           # CHANGED: 0=SERVO 1=OFFSET 2=APPROACH 3=DONE
             # --- Raw detection ---
             "det_valid",
             "det_conf",
@@ -86,6 +88,7 @@ class ControllerLogger:
     def log(
         self,
         now: float,
+        state: int,                            # CHANGED
         det: Optional[Detection],
         ok: bool,
         # Filtered measurements
@@ -136,6 +139,8 @@ class ControllerLogger:
 
         self.csv_writer.writerow([
             now,
+            # State machine
+            state,                             # CHANGED
             # Raw detection
             ok,
             None if det is None else det.conf,

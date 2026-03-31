@@ -75,7 +75,6 @@ class VisionProducer(threading.Thread):
         return frame
 
     @staticmethod
-    @staticmethod
     def _canonicalize_obb(w, h, theta):
         """Canonicalize OBB so that w >= h, with theta in (-90°, +90°]."""
         # First, wrap theta into (-90°, +90°]

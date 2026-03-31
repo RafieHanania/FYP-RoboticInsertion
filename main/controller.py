@@ -23,6 +23,13 @@ parameter (ratio of current fx to reference fx, supplied by app.py
 via camera_config) automatically scales them to the active resolution.
 Intrinsics (fx, fy, cx, cy) are passed in directly — no hardcoded
 defaults.
+
+State machine
+-------------
+SERVO    — IBVS: centre object at image centre + match scale & angle
+OFFSET   — blind lateral move to align TCP with target
+APPROACH — blind forward motion for final insertion
+DONE     — zero velocity, task complete
 """
 
 import time
@@ -39,10 +46,16 @@ from controller_logger import ControllerLogger
 cmd6 = Tuple[float, float, float, float, float, float]
 
 # ---- Reference-resolution defaults (640x480) ----
-_REF_W_D    = 60      # desired OBB width  (pixels @ 640x480)
-_REF_H_D    = 22.5      # desired OBB height (pixels @ 640x480)
-_REF_DEAD_U = 2.0       # pixel dead-zone    (pixels @ 640x480)
-_REF_DEAD_V = 2.0
+_REF_W_D    = 62.5        # desired OBB width  (pixels @ 640x480)
+_REF_H_D    = 24.4375     # desired OBB height (pixels @ 640x480)
+_REF_DEAD_U = 1.0       # pixel dead-zone    (pixels @ 640x480)
+_REF_DEAD_V = 1.0
+
+# ---- State machine states ----
+_STATE_SERVO    = 0
+_STATE_OFFSET   = 1      # CHANGED — new state
+_STATE_APPROACH = 2
+_STATE_DONE     = 3
 
 
 class VisualServoController(threading.Thread):
@@ -54,12 +67,12 @@ class VisualServoController(threading.Thread):
         stop_event: threading.Event,
         img_w: int,
         img_h: int,
-        # ---- Camera intrinsics (REQUIRED) ----                   # CHANGED
+        # ---- Camera intrinsics (REQUIRED) ----
         fx: float,
         fy: float,
         cx: float,
         cy: float,
-        # ---- Resolution scale factor (from camera_config) ----   # CHANGED
+        # ---- Resolution scale factor (from camera_config) ----
         resolution_scale: float = 1.0,
         # ---- Extrinsic: camera frame -> TCP frame (3x3 rotation) ----
         R_cam_to_tcp: np.ndarray = None,
@@ -67,37 +80,26 @@ class VisualServoController(threading.Thread):
         rate_hz: float = 100.0,
         conf_min: float = 0.2,
         stale_s: float = 0.2,
-        # ---- Desired feature values ----
-        # u_d: float = None,              # image center by default
-        # v_d: float = None,
-
-        # ---- After the existing desired feature parameters ----
-
-        # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----  # CHANGED
-        # Positive = TCP is in the +x / +y direction of camera frame
-        # Flip sign if the robot moves the wrong way on first test
-        tcp_offset_x: float = 0.024,    # ~3.4 cm
-        tcp_offset_y: float = 0.032,    # ~3.4 cm
-
-
-        theta_d: float = 0.0,          # desired OBB angle (rad)
+        # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----
+        # Used during OFFSET phase to shift TCP over target after centering
+        tcp_offset_x: float = -0.0385,
+        tcp_offset_y: float = -0.0335,
+        theta_d: float = 0.0,
         # ---- Desired bounding box size at target distance ----
-        #      None => auto-scale from 640x480 reference values    # CHANGED
         w_d: float = None,
         h_d: float = None,
         # ---- Depth calibration ----
-        Z_d: float = 0.117,             # depth (m) at which w_d, h_d were measured
+        Z_d: float = 0.117,
         # ---- IBVS gain lambda ----
         lam: float = 0.5,
         # ---- Dead-zones ----
-        #      None => auto-scale from 640x480 reference values    # CHANGED
         dead_u: float = None,
         dead_v: float = None,
         dead_theta: float = math.radians(2.0),
-        dead_scale: float = 0.05,      # ln-scale (approx 5% size tolerance)
+        dead_scale: float = 0.01,
         # ---- Velocity limits ----
         vxy_max: float = 0.05,
-        vz_max: float = 0.06,
+        vz_max: float = 0.03,
         wz_max: float = 0.6,
         # ---- Kalman filter tuning ----
         kf_sigma_pos: float = 2.0,
@@ -106,6 +108,11 @@ class VisualServoController(threading.Thread):
         kf_sigma_meas_size: float = 15.0,
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
+        # ---- Final approach parameters ----
+        approach_distance_m: float = 0.025,
+        approach_speed: float = 0.02,
+        offset_speed: float = 0.02,          # CHANGED — lateral speed during OFFSET
+        converge_dwell_s: float = 0.5,
     ):
         threading.Thread.__init__(self, daemon=True, name="ControllerThread")
         self.det_in = det_in
@@ -114,8 +121,10 @@ class VisualServoController(threading.Thread):
         self.rate_hz = rate_hz
         self.conf_min = conf_min
         self.stale_s = stale_s
+        self.img_w = img_w
+        self.img_h = img_h
 
-        s = resolution_scale                              # CHANGED — shorthand
+        s = resolution_scale
 
         # Intrinsics (passed in, no defaults)
         self.fx = fx
@@ -132,26 +141,22 @@ class VisualServoController(threading.Thread):
             ], dtype=float)
         else:
             R = np.asarray(R_cam_to_tcp, dtype=float)
-        
-        # FIXED — handle pseudovector correctly:
+
+        self._R_cam_to_tcp_3x3 = R                                # CHANGED — keep 3x3 for OFFSET
+
         d = np.linalg.det(R)
         self.T_cam_to_tcp = np.block([
             [R,                np.zeros((3, 3))],
-            [np.zeros((3, 3)), d * R           ],   # CHANGED: det(R) * R for angular velocity
+            [np.zeros((3, 3)), d * R           ],
         ])
-        # 6x6
 
-        # # Desired features — pixel targets auto-scaled               # CHANGED
-        # self.u_d     = u_d if u_d is not None else img_w / 2.0
-        # self.v_d     = v_d if v_d is not None else img_h / 2.0
-
-        # CHANGED — depth-dependent target, computed each frame
+        # TCP offset — used in OFFSET phase only (not during SERVO) # CHANGED
         self.tcp_offset_x = tcp_offset_x
         self.tcp_offset_y = tcp_offset_y
 
         self.theta_d = theta_d
-        self.w_d     = w_d if w_d is not None else _REF_W_D * s      # CHANGED
-        self.h_d     = h_d if h_d is not None else _REF_H_D * s      # CHANGED
+        self.w_d     = w_d if w_d is not None else _REF_W_D * s
+        self.h_d     = h_d if h_d is not None else _REF_H_D * s
         self.area_d  = self.w_d * self.h_d
 
         # Depth calibration
@@ -160,7 +165,7 @@ class VisualServoController(threading.Thread):
         # Gain
         self.lam = lam
 
-        # Dead-zones — pixel dead-zones auto-scaled                   # CHANGED
+        # Dead-zones
         self.dead_u     = dead_u if dead_u is not None else _REF_DEAD_U * s
         self.dead_v     = dead_v if dead_v is not None else _REF_DEAD_V * s
         self.dead_theta = dead_theta
@@ -180,19 +185,37 @@ class VisualServoController(threading.Thread):
             sigma_meas_size=kf_sigma_meas_size,
             sigma_meas_angle=kf_sigma_meas_angle,
         )
-        # self._last_det_t: float = 0.0
-        self._last_tick_t: float = 0.0       # wall time — for KF predict dt
-        self._last_det_stamp: float = 0.0    # det.t    — for new-frame gating
+        self._last_tick_t: float = 0.0
+        self._last_det_stamp: float = 0.0
+
+        # ---- State machine ----
+        self.approach_distance_m = approach_distance_m
+        self.approach_speed      = approach_speed
+        self.offset_speed        = offset_speed                    # CHANGED
+        self.converge_dwell_s    = converge_dwell_s
+
+        self._state: int              = _STATE_SERVO
+        self._converge_start_t: float = 0.0
+        self._offset_start_t: float   = 0.0                       # CHANGED
+        self._offset_duration: float  = 0.0                       # CHANGED
+        self._offset_cmd: cmd6        = (0, 0, 0, 0, 0, 0)        # CHANGED
+        self._approach_start_t: float = 0.0
 
         # Initialise command buffer
         self.cmd_out.set((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
 
-        # ---- Log the effective config for debugging ----            # CHANGED
+        # Log effective config
         print(f"[Controller] resolution_scale={s:.3f}  "
               f"fx={fx:.1f}  fy={fy:.1f}  cx={cx:.1f}  cy={cy:.1f}")
         print(f"[Controller] w_d={self.w_d:.1f}  h_d={self.h_d:.1f}  "
               f"dead_u={self.dead_u:.1f}  dead_v={self.dead_v:.1f}  "
               f"camera_fps={camera_fps:.1f}")
+        print(f"[Controller] tcp_offset=({tcp_offset_x*100:.1f}, "
+              f"{tcp_offset_y*100:.1f}) cm  "
+              f"approach={approach_distance_m*100:.1f} cm @ "
+              f"{approach_speed:.3f} m/s  "
+              f"offset_speed={offset_speed:.3f} m/s  "
+              f"dwell={converge_dwell_s:.2f} s")
 
     # ------------------------------------------------------------------
     # Depth estimator
@@ -217,7 +240,38 @@ class VisualServoController(threading.Thread):
         L_sigma = np.array([0.0, 0.0, -1.0 / Z, 0.0])
         L_theta = np.array([0.0, 0.0, 0.0, -1.0])
 
-        return np.vstack([Lu, Lv, L_sigma, L_theta])   # 4x4
+        return np.vstack([Lu, Lv, L_sigma, L_theta])
+
+    # ------------------------------------------------------------------
+    # Compute OFFSET phase velocity and duration                    # CHANGED
+    # ------------------------------------------------------------------
+    def _prepare_offset(self) -> None:
+        """
+        Compute the TCP-frame velocity command and duration for the
+        lateral OFFSET phase.
+
+        The offset [tcp_offset_x, tcp_offset_y, 0] is in camera frame.
+        Rotate it to TCP frame, then normalise to offset_speed.
+        """
+        offset_cam = np.array([self.tcp_offset_x, self.tcp_offset_y, 0.0])
+        offset_tcp = self._R_cam_to_tcp_3x3 @ offset_cam
+
+        dist = np.linalg.norm(offset_tcp)
+        if dist < 1e-6:
+            self._offset_duration = 0.0
+            self._offset_cmd = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            return
+
+        self._offset_duration = dist / self.offset_speed
+
+        # Unit direction scaled by speed
+        v = (offset_tcp / dist) * self.offset_speed
+        self._offset_cmd = (v[0], v[1], v[2], 0.0, 0.0, 0.0)
+
+        print(f"[Controller] OFFSET prepared: "
+              f"direction_tcp=({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}) m/s  "
+              f"duration={self._offset_duration:.2f} s  "
+              f"distance={dist*100:.1f} cm")
 
     # ------------------------------------------------------------------
     # Thread entry
@@ -251,6 +305,53 @@ class VisualServoController(threading.Thread):
         self, det: Optional[Detection], now: float, logger: ControllerLogger
     ) -> cmd6:
 
+        # ---- Helper for logging blind phases (no vision data) ----  # CHANGED
+        def _log_blind(cmd):
+            logger.log(
+                now=now, state=self._state, det=det, ok=False,
+                u_f=None, v_f=None, w_f=None, h_f=None, area=None,
+                sin_f=None, cos_f=None, theta_f=None,
+                Z_est=None, u_d=None, v_d=None, ln_sigma=None,
+                e=None, L_red=None, v_cam=None, v_tcp=None,
+                cmd=cmd,
+            )
+
+        # ---- OFFSET phase: blind lateral move ----
+        if self._state == _STATE_OFFSET:
+            elapsed = now - self._offset_start_t
+            if elapsed >= self._offset_duration:
+                self._state = _STATE_APPROACH
+                self._approach_start_t = now
+                print(f"[Controller] OFFSET complete → APPROACH "
+                      f"({self.approach_distance_m*100:.1f} cm at "
+                      f"{self.approach_speed:.3f} m/s)")
+                cmd = (0.0, 0.0, self.approach_speed, 0.0, 0.0, 0.0)
+                _log_blind(cmd)
+                return cmd
+            _log_blind(self._offset_cmd)
+            return self._offset_cmd
+
+        # ---- APPROACH phase: blind forward motion ----
+        if self._state == _STATE_APPROACH:
+            elapsed = now - self._approach_start_t
+            needed  = self.approach_distance_m / self.approach_speed
+            if elapsed >= needed:
+                self._state = _STATE_DONE
+                print("[Controller] APPROACH complete → DONE")
+                cmd = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                _log_blind(cmd)
+                return cmd
+            cmd = (0.0, 0.0, self.approach_speed, 0.0, 0.0, 0.0)
+            _log_blind(cmd)
+            return cmd
+
+        # ---- DONE phase: hold zero ----
+        if self._state == _STATE_DONE:
+            cmd = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            _log_blind(cmd)
+            return cmd
+
+        # ---- SERVO phase: IBVS with target = image centre ----
         vx = vy = vz = wx = wy = wz = 0.0
 
         ok = (
@@ -263,9 +364,10 @@ class VisualServoController(threading.Thread):
             if self.kf.initialised:
                 dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
                 self.kf.predict(dt=dt_pred)
+            self._converge_start_t = 0.0
             cmd = (vx, vy, vz, wx, wy, wz)
             logger.log(
-                now=now, det=det, ok=ok,
+                now=now, state=self._state, det=det, ok=ok,
                 u_f=None, v_f=None, w_f=None, h_f=None, area=None,
                 sin_f=None, cos_f=None, theta_f=None,
                 Z_est=None, u_d=None, v_d=None, ln_sigma=None,
@@ -279,10 +381,9 @@ class VisualServoController(threading.Thread):
         self._last_tick_t = now
 
         self.kf.predict(dt=dt_pred)
-        if det.t != self._last_det_stamp:    # same det.t means same camera frame
+        if det.t != self._last_det_stamp:
             self.kf.update(det)
             self._last_det_stamp = det.t
-
 
         u_f, v_f, w_f, h_f, theta_f = self.kf.state()
 
@@ -300,15 +401,23 @@ class VisualServoController(threading.Thread):
         # ---- 3. Estimate depth from area ----
         Z_est = self._estimate_Z(area)
 
-        # ---- 4. Depth-dependent target pixel (TCP-object alignment) ----
-        u_d = self.fx * self.tcp_offset_x / Z_est + self.cx
-        v_d = self.fy * self.tcp_offset_y / Z_est + self.cy
+        # ---- 4. Desired pixel = image centre ----                 # CHANGED
+        u_d = self.cx
+        v_d = self.cy
 
         # ---- 5. Compute feature error  e = s - s*  ----
         e_u     = u_f - u_d
         e_v     = v_f - v_d
         e_sigma = ln_sigma
         e_theta = wrap_to_pi(theta_f - self.theta_d)
+
+        # Check raw convergence BEFORE zeroing by dead-zone
+        all_converged = (
+            abs(e_u)     < self.dead_u
+            and abs(e_v)     < self.dead_v
+            and abs(e_sigma) < self.dead_scale
+            and abs(e_theta) < self.dead_theta
+        )
 
         if abs(e_u) < self.dead_u:
             e_u = 0.0
@@ -319,25 +428,41 @@ class VisualServoController(threading.Thread):
         if abs(e_theta) < self.dead_theta:
             e_theta = 0.0
 
+        # ---- Convergence dwell check ----
+        if all_converged:
+            if self._converge_start_t == 0.0:
+                self._converge_start_t = now
+                print("[Controller] Errors in dead-zone — dwell timer started")
+            elif (now - self._converge_start_t) >= self.converge_dwell_s:
+                # ---- Transition: SERVO → OFFSET ----              # CHANGED
+                self._prepare_offset()
+                self._state = _STATE_OFFSET
+                self._offset_start_t = now
+                print("[Controller] SERVO converged → OFFSET")
+                return self._offset_cmd
+        else:
+            if self._converge_start_t != 0.0:
+                self._converge_start_t = 0.0
+
         e = np.array([e_u, e_v, e_sigma, e_theta])
 
         # ---- 6. Build 4x4 reduced interaction matrix ----
         L_red = self._build_L_reduced(u_f, v_f, Z_est)
 
-        # ---- 6. Classical IBVS control law ----
+        # ---- 7. Classical IBVS control law ----
         try:
             v_cam = -self.lam * np.linalg.solve(L_red, e)
         except np.linalg.LinAlgError:
             v_cam = -self.lam * (np.linalg.pinv(L_red) @ e)
 
-        # ---- 7. Map camera-frame velocity -> TCP-frame velocity ----
+        # ---- 8. Map camera-frame velocity -> TCP-frame velocity ----
         v_cam_6 = np.array([
             v_cam[0], v_cam[1], v_cam[2],
             0.0, 0.0, v_cam[3],
         ])
         v_tcp = self.T_cam_to_tcp @ v_cam_6
 
-        # ---- 8. Clamp to velocity limits ----
+        # ---- 9. Clamp to velocity limits ----
         vx = clamp(v_tcp[0], -self.vxy_max, self.vxy_max)
         vy = clamp(v_tcp[1], -self.vxy_max, self.vxy_max)
         vz = clamp(v_tcp[2], -self.vz_max,  self.vz_max)
@@ -348,7 +473,7 @@ class VisualServoController(threading.Thread):
         cmd = (vx, vy, vz, wx, wy, wz)
 
         logger.log(
-            now=now, det=det, ok=ok,
+            now=now, state=self._state, det=det, ok=ok,
             u_f=u_f, v_f=v_f, w_f=w_f, h_f=h_f, area=area,
             sin_f=s_sin, cos_f=s_cos, theta_f=theta_f,
             Z_est=Z_est, u_d=u_d, v_d=v_d, ln_sigma=ln_sigma,
