@@ -102,8 +102,10 @@ class VisualServoController(threading.Thread):
         vz_max: float = 0.03,
         wz_max: float = 0.6,
         # ---- Kalman filter tuning ----
-        kf_sigma_pos: float = 2.0,
-        kf_sigma_vel: float = 20.0,
+        kf_sigma_accel_pos: float = 150.0,
+        # Continuous acceleration noise
+        kf_sigma_accel_size: float = 80.0,
+        kf_sigma_accel_angle: float = 3.0,
         kf_sigma_meas_pos: float = 15.0,
         kf_sigma_meas_size: float = 15.0,
         kf_sigma_meas_angle: float = 0.1,
@@ -179,8 +181,9 @@ class VisualServoController(threading.Thread):
         # Kalman filter
         self.kf = DetectionKalmanFilter(
             dt=1.0 / camera_fps,
-            sigma_pos=kf_sigma_pos,
-            sigma_vel=kf_sigma_vel,
+            sigma_accel_pos=kf_sigma_accel_pos,
+            sigma_accel_size=kf_sigma_accel_size,
+            sigma_accel_angle=kf_sigma_accel_angle,
             sigma_meas_pos=kf_sigma_meas_pos,
             sigma_meas_size=kf_sigma_meas_size,
             sigma_meas_angle=kf_sigma_meas_angle,

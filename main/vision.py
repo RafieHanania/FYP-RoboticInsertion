@@ -1,49 +1,94 @@
+"""
+Vision producer thread — camera capture, inference orchestration,
+and video recording.
+
+Delegates detection logic to ``inference_strategy`` (TiledSearch,
+ROITracker) and frame drawing to ``annotation``.
+
+The public interface consumed by ``app.py`` is unchanged:
+    VisionProducer(det_out, stop_event, img_w, img_h)
+    .start()
+    .latest_frame   — LatestValue buffer for cv2.imshow on main thread
+"""
+
 import traceback
 import time
 import threading
-from typing import Optional
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Annotator
+import os
+from typing import Optional, Tuple
+
 import cv2
 import numpy as np
-import math
-import os
+from ultralytics import YOLO
 
 from detection_types import Detection
 from buffers import LatestValue
-from camera_config import max_fps                              # CHANGED
+from camera_config import max_fps
+from inference_strategy import TiledSearch, ROITracker
+from annotation import annotate_frame
 
 MODEL_PATH = '../models/saved_runs/train/weights/best.pt'
-
-# Target box: USB-A port aspect ratio 12:4.5 area = 1000px^2
-_TARGET_RATIO = 12.0 / 4.5
-_TARGET_AREA  = 1000.0
-TARGET_W = int(round(math.sqrt(_TARGET_AREA * _TARGET_RATIO)))
-TARGET_H = int(round(math.sqrt(_TARGET_AREA / _TARGET_RATIO)))
-
 RECORD_DIR = "../recorded_session"
 
 
 class VisionProducer(threading.Thread):
     """
-    Provide inference using YOLO OBB.
+    YOLO OBB inference with two-mode adaptive strategy.
+
+    SEARCH — tiled inference for initial acquisition of small /
+             distant objects.
+    TRACK  — adaptive ROI crop for fast, high-resolution tracking.
     """
 
-    def __init__(self, det_out, stop_event: threading.Event, img_w: int, img_h: int):
+    def __init__(self, det_out, stop_event: threading.Event,
+                 img_w: int, img_h: int,
+                 # ---- Tiled SEARCH tuning ----
+                 tile_size: int = 640,
+                 tile_overlap: float = 0.25,
+                 # ---- ROI TRACK tuning ----
+                 roi_margin_mult: float = 3.0,
+                 roi_min_half: int = 150,
+                 roi_max_misses: int = 10,
+                 roi_recheck_interval: int = 30):
         threading.Thread.__init__(self, daemon=True, name="VisionThread")
         self.stop_event = stop_event
         self.det_out = det_out
         self.img_w = img_w
         self.img_h = img_h
         self.t0 = time.time()
-        self.model = YOLO(MODEL_PATH)
         self.latest_frame = LatestValue()
 
+        # ---- YOLO model ----
+        self.model = YOLO(MODEL_PATH)
+
+        # ---- Inference strategies ----
+        self._searcher = TiledSearch(img_w, img_h, tile_size, tile_overlap)
+        self._tracker = ROITracker(img_w, img_h,
+                                   margin_mult=roi_margin_mult,
+                                   min_half=roi_min_half,
+                                   max_misses=roi_max_misses,
+                                   recheck_interval=roi_recheck_interval)
+
+        # ---- State ----
+        self._mode = "SEARCH"
         self._writer: Optional[cv2.VideoWriter] = None
 
+    # ------------------------------------------------------------------
+    # YOLO predict (single entry point for all inference calls)
+    # ------------------------------------------------------------------
+    def predict(self, frame: np.ndarray):
+        return self.model.predict(
+            source=frame,
+            classes=[2],
+            device=0,
+            verbose=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Video recording
+    # ------------------------------------------------------------------
     def _init_writer(self, frame: np.ndarray, fps: float) -> None:
         os.makedirs(RECORD_DIR, exist_ok=True)
-
         timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(self.t0))
         path = os.path.join(RECORD_DIR, f'session_{timestamp}.mp4')
 
@@ -52,50 +97,9 @@ class VisionProducer(threading.Thread):
         self._writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
         print(f"[VisionProducer] Recording to {path}  ({w}x{h} @ {fps:.1f} fps)")
 
-    def _draw_target_overlay(self, frame: np.ndarray) -> np.ndarray:
-        """Draw a centered target rectangle representing the desired USB-A port size"""
-        cx, cy = frame.shape[1] // 2, frame.shape[0] // 2
-        hw, hh = TARGET_W // 2, TARGET_H // 2
-
-        x1, y1 = cx - hw, cy - hh
-        x2, y2 = cx + hw, cy + hh
-
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), cv2.FILLED)
-        cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
-
-        GAP, ARM = 2, 6
-        cv2.line(frame, (cx - ARM - GAP, cy), (cx - GAP, cy), (0, 255, 255), 1)
-        cv2.line(frame, (cx + GAP, cy), (cx + ARM, cy), (0, 255, 255), 1)
-        cv2.line(frame, (cx, cy - ARM - GAP), (cx, cy - GAP), (0, 255, 255), 1)
-        cv2.line(frame, (cx, cy + GAP), (cx, cy + ARM + GAP), (0, 255, 255), 1)
-
-        return frame
-
-    @staticmethod
-    def _canonicalize_obb(w, h, theta):
-        """Canonicalize OBB so that w >= h, with theta in (-90°, +90°]."""
-        # First, wrap theta into (-90°, +90°]
-        theta = (theta + math.pi / 2) % math.pi - math.pi / 2
-
-        # Ensure w is the longer dimension (matches USB-A physical aspect ratio)
-        if h > w:                          # CHANGED — was: theta > pi/4
-            w, h = h, w
-            theta += math.pi / 2 if theta <= 0 else -math.pi / 2
-
-        return w, h, theta
-
-    def predict(self, frame):
-        results = self.model.predict(
-            source=frame,
-            classes=[2],
-            device=0,
-            verbose=False
-        )
-        return results
-
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
     def run(self):
         try:
             cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
@@ -111,7 +115,7 @@ class VisionProducer(threading.Thread):
                 print("Failed to open Camera")
                 return
 
-            fps = max_fps(self.img_w, self.img_h)           # CHANGED
+            fps = max_fps(self.img_w, self.img_h)
 
             while not self.stop_event.is_set():
                 ok, frame = cap.read()
@@ -119,40 +123,55 @@ class VisionProducer(threading.Thread):
                     print("failed to read from camera")
                     continue
 
-                results = self.predict(frame)
+                det: Optional[Detection] = None
+                roi: Optional[Tuple[int, int, int]] = None
 
-                for result in results:
-                    annotated = result.plot(
-                        conf=False,
-                        line_width=1,
-                        labels=False
-                    )
-                    annotated = self._draw_target_overlay(annotated)
+                # ======================================================
+                # SEARCH — tiled inference
+                # ======================================================
+                if self._mode == "SEARCH":
+                    det = self._searcher.search(frame, self.predict)
 
-                    if result.obb is not None and len(result.obb) > 0:
-                        xywhr_np = result.obb.xywhr.cpu().numpy()
-                        conf_np = result.obb.conf.cpu().numpy()
-                        for (u, v, w, h, theta), conf in zip(xywhr_np, conf_np):
-                            w, h, theta = self._canonicalize_obb(w, h, theta)
+                    if det is not None:
+                        self._mode = "TRACK"
+                        self._tracker.reset(det)
+                        print(f"[Vision] SEARCH → TRACK  "
+                              f"(u={det.u:.0f}, v={det.v:.0f}, "
+                              f"conf={det.conf:.2f})")
 
-                            angle_deg = math.degrees(theta)
-                            cv2.putText(annotated, f"{angle_deg:.1f} deg",
-                                        (int(u), int(v) - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                        (0, 255, 0), 1, cv2.LINE_AA)
+                # ======================================================
+                # TRACK — adaptive ROI crop
+                # ======================================================
+                else:
+                    det, roi = self._tracker.track(frame, self.predict)
 
-                            det = Detection(
-                                t=time.time(),
-                                u=u, v=v, w=w, h=h,
-                                theta=theta, conf=conf,
-                            )
-                            self.det_out.set(det)
+                    if self._tracker.lost:
+                        self._mode = "SEARCH"
+                        print(f"[Vision] TRACK → SEARCH  "
+                              f"({self._tracker.miss_count} consecutive misses)")
 
-                    self.latest_frame.set(annotated)
+                # ======================================================
+                # Publish detection
+                # ======================================================
+                if det is not None:
+                    self.det_out.set(det)
 
-                    if self._writer is None:
-                        self._init_writer(annotated, fps)
-                    self._writer.write(annotated)
+                # ======================================================
+                # Annotate & record
+                # ======================================================
+                annotated = annotate_frame(
+                    frame, self._mode,
+                    det=det,
+                    roi=roi,
+                    tiles=self._searcher.tiles,
+                    miss_count=self._tracker.miss_count,
+                    max_misses=self._tracker.max_misses,
+                )
+                self.latest_frame.set(annotated)
+
+                if self._writer is None:
+                    self._init_writer(annotated, fps)
+                self._writer.write(annotated)
 
         except BaseException as e:
             print(f"[VisionProducer] CRASHED: {e}")
