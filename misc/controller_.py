@@ -5,7 +5,7 @@ from typing import Optional, Tuple
 
 from detection_types import Detection 
 from utils import clamp, wrap_to_pi, EMA
-from controller_logger import ControllerLogger
+from main.controller_logger import ControllerLogger
 
 cmd6 = Tuple[float, float, float, float, float, float]
 

@@ -99,7 +99,7 @@ class VisualServoController(threading.Thread):
         dead_scale: float = 0.01,
         # ---- Velocity limits ----
         vxy_max: float = 0.05,
-        vz_max: float = 0.03,
+        vz_max: float = 0.05,
         wz_max: float = 0.6,
         # ---- Kalman filter tuning ----
         kf_sigma_accel_pos: float = 150.0,
@@ -111,7 +111,7 @@ class VisualServoController(threading.Thread):
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
         # ---- Final approach parameters ----
-        approach_distance_m: float = 0.025,
+        approach_distance_m: float = 0.01,
         approach_speed: float = 0.02,
         offset_speed: float = 0.02,          # CHANGED — lateral speed during OFFSET
         converge_dwell_s: float = 0.5,
@@ -363,12 +363,18 @@ class VisualServoController(threading.Thread):
             and (now - det.t) <= self.stale_s
         )
 
-        if not ok:
-            if self.kf.initialised:
-                dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
-                self.kf.predict(dt=dt_pred)
-            self._converge_start_t = 0.0
-            cmd = (vx, vy, vz, wx, wy, wz)
+        # ---- 1. Kalman predict + update ----
+        dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
+        self._last_tick_t = now
+        if self.kf.initialised:
+            self.kf.predict(dt=dt_pred)
+
+        if ok and det.t != self._last_det_stamp:
+            self.kf.update(det)
+            self._last_det_stamp = det.t
+
+        if not self.kf.initialised:
+            cmd = (0,0,0,0,0,0)
             logger.log(
                 now=now, state=self._state, det=det, ok=ok,
                 u_f=None, v_f=None, w_f=None, h_f=None, area=None,
@@ -378,15 +384,6 @@ class VisualServoController(threading.Thread):
                 cmd=cmd,
             )
             return cmd
-
-        # ---- 1. Kalman predict + update ----
-        dt_pred = now - self._last_tick_t if self._last_tick_t > 0 else None
-        self._last_tick_t = now
-
-        self.kf.predict(dt=dt_pred)
-        if det.t != self._last_det_stamp:
-            self.kf.update(det)
-            self._last_det_stamp = det.t
 
         u_f, v_f, w_f, h_f, theta_f = self.kf.state()
 
@@ -450,7 +447,11 @@ class VisualServoController(threading.Thread):
         e = np.array([e_u, e_v, e_sigma, e_theta])
 
         # ---- 6. Build 4x4 reduced interaction matrix ----
-        L_red = self._build_L_reduced(u_f, v_f, Z_est)
+        # Evaluate L at the midpoint (s + s*) / 2.0
+        u_mid = (u_f + u_d) / 2.0
+        v_mid = (v_f + v_d) / 2.0
+        Z_mid = (Z_est + self.Z_d) / 2.0
+        L_red = self._build_L_reduced(u_mid, v_mid, Z_mid)
 
         # ---- 7. Classical IBVS control law ----
         try:
