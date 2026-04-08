@@ -3,7 +3,7 @@ from app import VisualServoApp
 import cv2
 
 RTDE_PORT = 30004
-ROBOT_IP = "169.254.194.220"
+ROBOT_IP = "10.149.230.1"
 RECIPE_PATH = "control_loop_configuration.xml"
 RATE_HZ = 100
 

@@ -32,6 +32,9 @@ class RTDEStreamer(threading.Thread):
         self.recipe_path = recipe_path
         self.rate_hz = rate_hz
         self.rtde_port = rtde_port
+        self._last_tcp_pose: list = None          # populated during run()
+        self._motion_start_t: float = None        # time of first non-zero cmd
+        self._motion_end_t: float = None          # time of last non-zero cmd
 
     def run(self):
         dt = 1.0 / self.rate_hz
@@ -77,6 +80,7 @@ class RTDEStreamer(threading.Thread):
 
                 # Extract rotation-vector part of actual_tcp_pose
                 tcp_pose = state.actual_TCP_pose
+                self._last_tcp_pose = list(tcp_pose)          # store for final print
                 rx, ry, rz = tcp_pose[3], tcp_pose[4], tcp_pose[5]
 
                 # Read TCP-frame command from controller
@@ -92,6 +96,15 @@ class RTDEStreamer(threading.Thread):
                 ) 
 
                 self._write_cmd(setp, cmd_base)
+
+                # ---- Convergence timer ----
+                is_moving = any(abs(v) > 1e-9 for v in cmd_base)
+                if is_moving:
+                    if self._motion_start_t is None:
+                        self._motion_start_t = time.time()
+                        print("[RTDEStreamer] Motion started — convergence timer running")
+                    self._motion_end_t = time.time()
+
                 # print(dt)
 
                 heartbeat += 1
@@ -113,6 +126,14 @@ class RTDEStreamer(threading.Thread):
             raise
 
         finally:
+            if self._last_tcp_pose is not None:
+                x, y, z, rx, ry, rz = self._last_tcp_pose
+                print("\n[RTDEStreamer] ── Final TCP pose ──")
+                print(f"  Position  : x={x*1000:.2f} mm  y={y*1000:.2f} mm  z={z*1000:.2f} mm")
+                print(f"  Rotation  : rx={rx:.4f} rad  ry={ry:.4f} rad  rz={rz:.4f} rad")
+            if self._motion_start_t is not None and self._motion_end_t is not None:
+                elapsed = self._motion_end_t - self._motion_start_t
+                print(f"  Convergence time : {elapsed:.3f} s")
             try:
                 con.send_pause()
             except Exception:
@@ -146,6 +167,3 @@ class RTDEStreamer(threading.Thread):
         for i, v in enumerate(list):
             setattr(sp, f"input_double_register_{i}", v)
         return sp
-                
-            
-

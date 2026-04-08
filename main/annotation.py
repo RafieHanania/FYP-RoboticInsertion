@@ -16,7 +16,7 @@ from detection_types import Detection
 
 # ---- USB-A target overlay sizing ----
 _TARGET_RATIO = 12.0 / 4.5
-_TARGET_AREA  = 1000.0
+_TARGET_AREA  = 2500.0
 TARGET_W = int(round(math.sqrt(_TARGET_AREA * _TARGET_RATIO)))
 TARGET_H = int(round(math.sqrt(_TARGET_AREA / _TARGET_RATIO)))
 

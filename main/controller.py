@@ -46,10 +46,10 @@ from controller_logger import ControllerLogger
 cmd6 = Tuple[float, float, float, float, float, float]
 
 # ---- Reference-resolution defaults (640x480) ----
-_REF_W_D    = 62.5        # desired OBB width  (pixels @ 640x480)
-_REF_H_D    = 24.4375     # desired OBB height (pixels @ 640x480)
-_REF_DEAD_U = 1.0       # pixel dead-zone    (pixels @ 640x480)
-_REF_DEAD_V = 1.0
+_REF_W_D    = 85.2        # desired OBB width  (pixels @ 640x480)
+_REF_H_D    = 34.47     # desired OBB height (pixels @ 640x480)
+_REF_DEAD_U = 0.5       # pixel dead-zone    (pixels @ 640x480)
+_REF_DEAD_V = 0.5
 
 # ---- State machine states ----
 _STATE_SERVO    = 0
@@ -82,20 +82,20 @@ class VisualServoController(threading.Thread):
         stale_s: float = 0.2,
         # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----
         # Used during OFFSET phase to shift TCP over target after centering
-        tcp_offset_x: float = -0.0385,
-        tcp_offset_y: float = -0.0335,
+        tcp_offset_x: float = -0.0335,
+        tcp_offset_y: float = -0.0385,
         theta_d: float = 0.0,
         # ---- Desired bounding box size at target distance ----
         w_d: float = None,
         h_d: float = None,
         # ---- Depth calibration ----
-        Z_d: float = 0.117,
+        Z_d: float = 0.140,
         # ---- IBVS gain lambda ----
         lam: float = 0.5,
         # ---- Dead-zones ----
         dead_u: float = None,
         dead_v: float = None,
-        dead_theta: float = math.radians(2.0),
+        dead_theta: float = math.radians(1.5),
         dead_scale: float = 0.01,
         # ---- Velocity limits ----
         vxy_max: float = 0.05,
@@ -111,7 +111,7 @@ class VisualServoController(threading.Thread):
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
         # ---- Final approach parameters ----
-        approach_distance_m: float = 0.01,
+        approach_distance_m: float = 0.026,
         approach_speed: float = 0.02,
         offset_speed: float = 0.02,          # CHANGED — lateral speed during OFFSET
         converge_dwell_s: float = 0.5,
@@ -290,7 +290,7 @@ class VisualServoController(threading.Thread):
                 det: Optional[Detection] = self.det_in.get()
                 cmd = self.compute_cmd(det, now, logger)
                 self.cmd_out.set(cmd)
-                print(cmd)
+                # print(cmd)
 
                 next_t += dt
                 sleep_s = next_t - time.time()
