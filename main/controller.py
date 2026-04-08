@@ -46,8 +46,8 @@ from controller_logger import ControllerLogger
 cmd6 = Tuple[float, float, float, float, float, float]
 
 # ---- Reference-resolution defaults (640x480) ----
-_REF_W_D    = 85.2        # desired OBB width  (pixels @ 640x480)
-_REF_H_D    = 34.47     # desired OBB height (pixels @ 640x480)
+_REF_W_D    = 62.5        # desired OBB width  (pixels @ 640x480)
+_REF_H_D    = 24.4375     # desired OBB height (pixels @ 640x480)
 _REF_DEAD_U = 0.5       # pixel dead-zone    (pixels @ 640x480)
 _REF_DEAD_V = 0.5
 
@@ -89,7 +89,7 @@ class VisualServoController(threading.Thread):
         w_d: float = None,
         h_d: float = None,
         # ---- Depth calibration ----
-        Z_d: float = 0.140,
+        Z_d: float = 0.117,
         # ---- IBVS gain lambda ----
         lam: float = 0.5,
         # ---- Dead-zones ----
@@ -111,7 +111,7 @@ class VisualServoController(threading.Thread):
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
         # ---- Final approach parameters ----
-        approach_distance_m: float = 0.026,
+        approach_distance_m: float = 0.01,
         approach_speed: float = 0.02,
         offset_speed: float = 0.02,          # CHANGED — lateral speed during OFFSET
         converge_dwell_s: float = 0.5,
