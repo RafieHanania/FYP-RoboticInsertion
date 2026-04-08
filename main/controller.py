@@ -30,6 +30,18 @@ SERVO    — IBVS: centre object at image centre + match scale & angle
 OFFSET   — blind lateral move to align TCP with target
 APPROACH — blind forward motion for final insertion
 DONE     — zero velocity, task complete
+
+Wrist-invariant OFFSET and APPROACH
+-------------------------------------
+Both the OFFSET and APPROACH phases compute their TCP-frame command
+by pre-rotating the desired base-frame vector using the live wrist pose
+at the moment of transition. The streamer's vel_tcp_to_base then cancels
+this back to the intended base-frame direction, making both phases
+independent of wrist orientation.
+
+  OFFSET  : desired direction in base frame derived from the physical
+             camera-to-TCP offset vector rotated by the live wrist pose.
+  APPROACH: desired direction is always base-frame +z (port insertion axis).
 """
 
 import time
@@ -39,7 +51,7 @@ import numpy as np
 from typing import Optional, Tuple
 
 from detection_types import Detection
-from utils import clamp, wrap_to_pi
+from utils import clamp, wrap_to_pi, rotvec_to_matrix
 from filters import DetectionKalmanFilter
 from controller_logger import ControllerLogger
 
@@ -48,12 +60,12 @@ cmd6 = Tuple[float, float, float, float, float, float]
 # ---- Reference-resolution defaults (640x480) ----
 _REF_W_D    = 62.5        # desired OBB width  (pixels @ 640x480)
 _REF_H_D    = 24.4375     # desired OBB height (pixels @ 640x480)
-_REF_DEAD_U = 0.5       # pixel dead-zone    (pixels @ 640x480)
+_REF_DEAD_U = 0.5         # pixel dead-zone    (pixels @ 640x480)
 _REF_DEAD_V = 0.5
 
 # ---- State machine states ----
 _STATE_SERVO    = 0
-_STATE_OFFSET   = 1      # CHANGED — new state
+_STATE_OFFSET   = 1
 _STATE_APPROACH = 2
 _STATE_DONE     = 3
 
@@ -80,10 +92,12 @@ class VisualServoController(threading.Thread):
         rate_hz: float = 100.0,
         conf_min: float = 0.2,
         stale_s: float = 0.2,
+        # ---- Shared TCP pose from streamer (LatestValue) ----
+        tcp_pose_in=None,
         # ---- Camera-to-TCP lateral offset (meters, in camera frame) ----
-        # Used during OFFSET phase to shift TCP over target after centering
-        tcp_offset_x: float = -0.0335,
-        tcp_offset_y: float = -0.0385,
+        # Physical measurement: camera optical centre to TCP
+        tcp_offset_x: float = -0.03573,
+        tcp_offset_y: float = -0.0348,
         theta_d: float = 0.0,
         # ---- Desired bounding box size at target distance ----
         w_d: float = None,
@@ -103,7 +117,6 @@ class VisualServoController(threading.Thread):
         wz_max: float = 0.6,
         # ---- Kalman filter tuning ----
         kf_sigma_accel_pos: float = 150.0,
-        # Continuous acceleration noise
         kf_sigma_accel_size: float = 80.0,
         kf_sigma_accel_angle: float = 3.0,
         kf_sigma_meas_pos: float = 15.0,
@@ -111,9 +124,9 @@ class VisualServoController(threading.Thread):
         kf_sigma_meas_angle: float = 0.1,
         camera_fps: float = 30.0,
         # ---- Final approach parameters ----
-        approach_distance_m: float = 0.01,
+        approach_distance_m: float = 0.013,
         approach_speed: float = 0.02,
-        offset_speed: float = 0.02,          # CHANGED — lateral speed during OFFSET
+        offset_speed: float = 0.02,
         converge_dwell_s: float = 0.5,
     ):
         threading.Thread.__init__(self, daemon=True, name="ControllerThread")
@@ -144,7 +157,7 @@ class VisualServoController(threading.Thread):
         else:
             R = np.asarray(R_cam_to_tcp, dtype=float)
 
-        self._R_cam_to_tcp_3x3 = R                                # CHANGED — keep 3x3 for OFFSET
+        self._R_cam_to_tcp_3x3 = R
 
         d = np.linalg.det(R)
         self.T_cam_to_tcp = np.block([
@@ -152,7 +165,10 @@ class VisualServoController(threading.Thread):
             [np.zeros((3, 3)), d * R           ],
         ])
 
-        # TCP offset — used in OFFSET phase only (not during SERVO) # CHANGED
+        # Shared live TCP pose from streamer
+        self.tcp_pose_in = tcp_pose_in
+
+        # TCP offset — physical camera-to-TCP displacement in camera frame
         self.tcp_offset_x = tcp_offset_x
         self.tcp_offset_y = tcp_offset_y
 
@@ -194,15 +210,16 @@ class VisualServoController(threading.Thread):
         # ---- State machine ----
         self.approach_distance_m = approach_distance_m
         self.approach_speed      = approach_speed
-        self.offset_speed        = offset_speed                    # CHANGED
+        self.offset_speed        = offset_speed
         self.converge_dwell_s    = converge_dwell_s
 
         self._state: int              = _STATE_SERVO
         self._converge_start_t: float = 0.0
-        self._offset_start_t: float   = 0.0                       # CHANGED
-        self._offset_duration: float  = 0.0                       # CHANGED
-        self._offset_cmd: cmd6        = (0, 0, 0, 0, 0, 0)        # CHANGED
+        self._offset_start_t: float   = 0.0
+        self._offset_duration: float  = 0.0
+        self._offset_cmd: cmd6        = (0, 0, 0, 0, 0, 0)
         self._approach_start_t: float = 0.0
+        self._approach_cmd: cmd6      = (0, 0, 0, 0, 0, 0)
 
         # Initialise command buffer
         self.cmd_out.set((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
@@ -213,8 +230,8 @@ class VisualServoController(threading.Thread):
         print(f"[Controller] w_d={self.w_d:.1f}  h_d={self.h_d:.1f}  "
               f"dead_u={self.dead_u:.1f}  dead_v={self.dead_v:.1f}  "
               f"camera_fps={camera_fps:.1f}")
-        print(f"[Controller] tcp_offset=({tcp_offset_x*100:.1f}, "
-              f"{tcp_offset_y*100:.1f}) cm  "
+        print(f"[Controller] tcp_offset=({tcp_offset_x*100:.3f}, "
+              f"{tcp_offset_y*100:.3f}) cm  "
               f"approach={approach_distance_m*100:.1f} cm @ "
               f"{approach_speed:.3f} m/s  "
               f"offset_speed={offset_speed:.3f} m/s  "
@@ -238,26 +255,60 @@ class VisualServoController(threading.Thread):
         up = u_px - self.cx
         vp = v_px - self.cy
 
-        Lu = np.array([-fx / Z, 0.0, up / Z, vp * fx / fy])
-        Lv = np.array([0.0, -fy / Z, vp / Z, -up * fy / fx])
-        L_sigma = np.array([0.0, 0.0, -1.0 / Z, 0.0])
-        L_theta = np.array([0.0, 0.0, 0.0, -1.0])
+        Lu      = np.array([-fx / Z, 0.0,     up / Z,  vp * fx / fy])
+        Lv      = np.array([0.0,    -fy / Z,  vp / Z, -up * fy / fx])
+        L_sigma = np.array([0.0,     0.0,    -1.0 / Z,  0.0         ])
+        L_theta = np.array([0.0,     0.0,     0.0,      -1.0        ])
 
         return np.vstack([Lu, Lv, L_sigma, L_theta])
 
     # ------------------------------------------------------------------
-    # Compute OFFSET phase velocity and duration                    # CHANGED
+    # Helper: get R_tcp_to_base from shared TCP pose
+    # ------------------------------------------------------------------
+    def _get_R_tcp_to_base(self) -> Optional[np.ndarray]:
+        """
+        Returns the 3x3 rotation matrix R_tcp_to_base from the live
+        TCP pose, or None if the pose is not yet available.
+        """
+        tcp_pose = self.tcp_pose_in.get() if self.tcp_pose_in is not None else None
+        if tcp_pose is None:
+            return None
+        rx, ry, rz = tcp_pose[3], tcp_pose[4], tcp_pose[5]
+        return rotvec_to_matrix(rx, ry, rz)
+
+    # ------------------------------------------------------------------
+    # Compute OFFSET phase velocity and duration
     # ------------------------------------------------------------------
     def _prepare_offset(self) -> None:
         """
         Compute the TCP-frame velocity command and duration for the
         lateral OFFSET phase.
 
-        The offset [tcp_offset_x, tcp_offset_y, 0] is in camera frame.
-        Rotate it to TCP frame, then normalise to offset_speed.
+        The physical camera-to-TCP offset [tcp_offset_x, tcp_offset_y, 0]
+        is expressed in camera frame. It is rotated to TCP frame via
+        R_cam_to_tcp, then to base frame via R_tcp_to_base. The base-frame
+        vector is then pre-rotated back to TCP frame by R_tcp_to_base.T so
+        that when the streamer applies vel_tcp_to_base, the result is the
+        correct base-frame direction regardless of wrist orientation.
         """
+        R_tcp_to_base = self._get_R_tcp_to_base()
+
+        # camera frame -> TCP frame
         offset_cam = np.array([self.tcp_offset_x, self.tcp_offset_y, 0.0])
-        offset_tcp = self._R_cam_to_tcp_3x3 @ offset_cam
+        offset_tcp_raw = self._R_cam_to_tcp_3x3 @ offset_cam
+
+        if R_tcp_to_base is None:
+            print("[Controller] WARNING: no TCP pose for OFFSET, "
+                  "falling back to TCP-frame offset")
+            offset_tcp = offset_tcp_raw
+        else:
+            # TCP frame -> base frame (wrist-invariant world direction)
+            offset_base = R_tcp_to_base @ offset_tcp_raw
+            # Pre-rotate back to TCP frame so streamer cancels to offset_base
+            offset_tcp = R_tcp_to_base.T @ offset_base
+            print(f"[Controller] OFFSET base-frame direction: "
+                  f"({offset_base[0]*100:.2f}, {offset_base[1]*100:.2f}, "
+                  f"{offset_base[2]*100:.2f}) cm")
 
         dist = np.linalg.norm(offset_tcp)
         if dist < 1e-6:
@@ -266,15 +317,43 @@ class VisualServoController(threading.Thread):
             return
 
         self._offset_duration = dist / self.offset_speed
-
-        # Unit direction scaled by speed
         v = (offset_tcp / dist) * self.offset_speed
         self._offset_cmd = (v[0], v[1], v[2], 0.0, 0.0, 0.0)
 
         print(f"[Controller] OFFSET prepared: "
               f"direction_tcp=({v[0]:.4f}, {v[1]:.4f}, {v[2]:.4f}) m/s  "
               f"duration={self._offset_duration:.2f} s  "
-              f"distance={dist*100:.1f} cm")
+              f"distance={dist*100:.2f} cm")
+
+    # ------------------------------------------------------------------
+    # Compute APPROACH phase velocity command
+    # ------------------------------------------------------------------
+    def _prepare_approach(self) -> cmd6:
+        """
+        Compute the TCP-frame velocity command for the APPROACH phase
+        such that the robot always moves along base-frame +z (the port
+        insertion axis), regardless of wrist orientation.
+
+        Pre-rotates the desired base-frame +z vector by R_tcp_to_base.T
+        so that the streamer's vel_tcp_to_base cancels it back to base +z.
+        """
+        R_tcp_to_base = self._get_R_tcp_to_base()
+
+        if R_tcp_to_base is None:
+            print("[Controller] WARNING: no TCP pose for APPROACH, "
+                  "falling back to TCP-frame +z")
+            return (0.0, 0.0, self.approach_speed, 0.0, 0.0, 0.0)
+
+        # Desired motion: pure base-frame +z (port insertion axis)
+        v_base = np.array([0.0, 0.0, -self.approach_speed])
+
+        # Pre-rotate to TCP frame so streamer maps it back to base +z
+        v_tcp = R_tcp_to_base.T @ v_base
+
+        print(f"[Controller] APPROACH prepared: "
+              f"direction_tcp=({v_tcp[0]:.4f}, {v_tcp[1]:.4f}, {v_tcp[2]:.4f}) m/s")
+
+        return (float(v_tcp[0]), float(v_tcp[1]), float(v_tcp[2]), 0.0, 0.0, 0.0)
 
     # ------------------------------------------------------------------
     # Thread entry
@@ -290,7 +369,6 @@ class VisualServoController(threading.Thread):
                 det: Optional[Detection] = self.det_in.get()
                 cmd = self.compute_cmd(det, now, logger)
                 self.cmd_out.set(cmd)
-                # print(cmd)
 
                 next_t += dt
                 sleep_s = next_t - time.time()
@@ -308,7 +386,6 @@ class VisualServoController(threading.Thread):
         self, det: Optional[Detection], now: float, logger: ControllerLogger
     ) -> cmd6:
 
-        # ---- Helper for logging blind phases (no vision data) ----  # CHANGED
         def _log_blind(cmd):
             logger.log(
                 now=now, state=self._state, det=det, ok=False,
@@ -323,18 +400,18 @@ class VisualServoController(threading.Thread):
         if self._state == _STATE_OFFSET:
             elapsed = now - self._offset_start_t
             if elapsed >= self._offset_duration:
+                self._approach_cmd = self._prepare_approach()
                 self._state = _STATE_APPROACH
                 self._approach_start_t = now
                 print(f"[Controller] OFFSET complete → APPROACH "
                       f"({self.approach_distance_m*100:.1f} cm at "
                       f"{self.approach_speed:.3f} m/s)")
-                cmd = (0.0, 0.0, self.approach_speed, 0.0, 0.0, 0.0)
-                _log_blind(cmd)
-                return cmd
+                _log_blind(self._approach_cmd)
+                return self._approach_cmd
             _log_blind(self._offset_cmd)
             return self._offset_cmd
 
-        # ---- APPROACH phase: blind forward motion ----
+        # ---- APPROACH phase: blind forward motion along base +z ----
         if self._state == _STATE_APPROACH:
             elapsed = now - self._approach_start_t
             needed  = self.approach_distance_m / self.approach_speed
@@ -344,9 +421,8 @@ class VisualServoController(threading.Thread):
                 cmd = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                 _log_blind(cmd)
                 return cmd
-            cmd = (0.0, 0.0, self.approach_speed, 0.0, 0.0, 0.0)
-            _log_blind(cmd)
-            return cmd
+            _log_blind(self._approach_cmd)
+            return self._approach_cmd
 
         # ---- DONE phase: hold zero ----
         if self._state == _STATE_DONE:
@@ -374,7 +450,7 @@ class VisualServoController(threading.Thread):
             self._last_det_stamp = det.t
 
         if not self.kf.initialised:
-            cmd = (0,0,0,0,0,0)
+            cmd = (0, 0, 0, 0, 0, 0)
             logger.log(
                 now=now, state=self._state, det=det, ok=ok,
                 u_f=None, v_f=None, w_f=None, h_f=None, area=None,
@@ -401,7 +477,7 @@ class VisualServoController(threading.Thread):
         # ---- 3. Estimate depth from area ----
         Z_est = self._estimate_Z(area)
 
-        # ---- 4. Desired pixel = image centre ----                 # CHANGED
+        # ---- 4. Desired pixel = image centre ----
         u_d = self.cx
         v_d = self.cy
 
@@ -434,7 +510,6 @@ class VisualServoController(threading.Thread):
                 self._converge_start_t = now
                 print("[Controller] Errors in dead-zone — dwell timer started")
             elif (now - self._converge_start_t) >= self.converge_dwell_s:
-                # ---- Transition: SERVO → OFFSET ----              # CHANGED
                 self._prepare_offset()
                 self._state = _STATE_OFFSET
                 self._offset_start_t = now

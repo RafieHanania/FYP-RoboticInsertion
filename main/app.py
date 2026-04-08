@@ -6,7 +6,6 @@ from controller import VisualServoController
 from rtde_streamer import RTDEStreamer
 from vision import VisionProducer
 
-
 class VisualServoApp:
     def __init__(self, robot_ip: int,
                  recipe_path: str,
@@ -24,6 +23,8 @@ class VisualServoApp:
         scale   = scale_factor(img_w, img_h)
         cam_fps = max_fps(img_w, img_h)
 
+        tcp_pose_shared = LatestValue()
+
         self.vision = VisionProducer(
             self.latest_det, self.stop_event, img_w, img_h,
         )
@@ -35,10 +36,11 @@ class VisualServoApp:
             rate_hz=rate_hz,
             resolution_scale=scale,
             camera_fps=cam_fps,
+            tcp_pose_in=tcp_pose_shared
         )
         self.streamer = RTDEStreamer(
             self.latest_cmd, self.stop_event,
-            robot_ip, recipe_path, rate_hz, rtde_port,
+            robot_ip, recipe_path, rate_hz, rtde_port, tcp_pose_out=tcp_pose_shared
         )
 
     def start(self):
