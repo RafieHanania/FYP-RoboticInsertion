@@ -300,7 +300,7 @@ Key references that informed the design (full list in the report):
 
 ## Acknowledgements
 
-- FYP supervisor: **Cheah Chien Chern**, NTU
+- FYP supervisor: **Assoc Prof. Cheah Chien Chern**, NTU
 - Ultralytics for the YOLOv11-OBB framework and DOTAv1 pretrained weights
 - Universal Robots for the RTDE Python client
 - Port dataset: Kaggle (relabelled for OBB annotation)
